@@ -1,0 +1,239 @@
+name: immortalwrt_r4se
+
+on:
+  schedule:
+    - cron: 0 16 * * *
+  workflow_dispatch:
+
+env:
+  REPO_URL: https://github.com/DHDAXCW/immortalwrt
+  REPO_BRANCH: openwrt-24.10
+  CONFIG_FILE: immortalwrt/rockchip/defconfig
+  DIY_P1_SH: immortalwrt/diy-part1.sh
+  DIY_P2_SH: immortalwrt/diy-part2.sh
+  UPLOAD_FIRMWARE: true
+  UPLOAD_RELEASE: true
+  TZ: Asia/Shanghai
+  OPENWRT_NAME: immortalwrt
+  DEVICE_NAME: r4se  # 修改为R4SE
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Maximize build space
+      uses: easimon/maximize-build-space@master
+      with:
+        root-reserve-mb: 512
+        swap-size-mb: 1024
+        remove-dotnet: 'true'
+        remove-android: 'true'
+        remove-haskell: 'true'
+        remove-codeql: 'true'
+        
+    - name: Check out the project branch
+      uses: actions/checkout@main
+      with:
+          fetch-depth: 0
+
+    - name: Clean build caches
+      run: |
+        echo "Cleaning previous build artifacts and caches..."
+        sudo rm -rf $GITHUB_WORKSPACE/openwrt || true
+        sudo rm -rf $RUNNER_TEMP/* || true
+        sudo rm -rf $RUNNER_TOOL_CACHE/* || true
+        sudo apt-get -qq clean || true
+        sudo rm -rf /var/lib/apt/lists/* || true
+        rm -rf ~/.cache/* || true
+        echo "Cache cleanup complete."
+          
+    - name: Initialize the compilation environment
+      env:
+        DEBIAN_FRONTEND: noninteractive
+      run: |
+        sudo -E apt-get -qq update
+        sudo apt install -y ack antlr3 asciidoc autoconf automake autopoint binutils bison build-essential \
+            bzip2 ccache clang cmake cpio curl device-tree-compiler ecj fastjar flex gawk gettext gcc-multilib \
+            g++-multilib git gnutls-dev gperf haveged help2man intltool lib32gcc-s1 libc6-dev-i386 libelf-dev \
+            libglib2.0-dev libgmp3-dev libltdl-dev libmpc-dev libmpfr-dev libncurses-dev libpython3-dev \
+            libreadline-dev libssl-dev libtool libyaml-dev libz-dev lld llvm lrzsz mkisofs msmtp nano \
+            ninja-build p7zip p7zip-full patch pkgconf python3 python3-pip python3-ply python3-docutils \
+            python3-pyelftools qemu-utils re2c rsync scons squashfs-tools subversion swig texinfo uglifyjs \
+            upx-ucl unzip vim wget xmlto xxd zlib1g-dev zstd
+        sudo -E apt-get -qq purge azure-cli ghc* zulu* hhvm llvm* firefox powershell openjdk* dotnet* google* mysql* php* android* rename speedtest-cli
+        sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc
+        sudo -E apt-get -qq autoremove --purge
+        sudo -E apt-get -qq clean
+        sudo timedatectl set-timezone "$TZ"
+        
+    - name: Initialize Environment and Display System Info
+      env:
+        DEBIAN_FRONTEND: noninteractive
+      run: |
+        chmod +x $OPENWRT_NAME/*.sh
+        $GITHUB_WORKSPACE/$OPENWRT_NAME/system-Information.sh
+        
+    - name: Download firmware source code
+      run: |
+        git clone --depth 1 $REPO_URL -b $REPO_BRANCH openwrt
+
+    - name: Update & install feeds
+      working-directory: ./openwrt
+      run: |
+        ./scripts/feeds update -a
+        ./scripts/feeds install -a
+        
+    - name: Load feeds.conf.default
+      run: |
+        chmod +x $OPENWRT_NAME/*.sh
+        cd openwrt
+        $GITHUB_WORKSPACE/$DIY_P1_SH
+
+    - name: Load config
+      run: |
+        [ -e "$CONFIG_FILE" ] && cat "$CONFIG_FILE" > openwrt/.config
+        chmod +x $OPENWRT_NAME/*.sh && cd openwrt
+        $GITHUB_WORKSPACE/$DIY_P2_SH
+
+    - name: Configure for R4SE only
+      run: |
+        cd openwrt
+        # 只保留R4SE相关配置，移除其他设备
+        echo '
+        # 目标系统配置
+        CONFIG_TARGET_rockchip=y
+        CONFIG_TARGET_rockchip_armv8=y
+        CONFIG_TARGET_rockchip_armv8_DEVICE_friendlyarm_nanopi-r4se=y
+        
+        # Docker配置
+        CONFIG_DOCKER_CGROUP_OPTIONS=y
+        CONFIG_DOCKER_NET_MACVLAN=y
+        CONFIG_DOCKER_STO_EXT4=y
+        CONFIG_PACKAGE_docker=y
+        CONFIG_PACKAGE_docker-compose=y
+        CONFIG_PACKAGE_dockerd=y
+        CONFIG_PACKAGE_luci-app-dockerman=y
+        CONFIG_PACKAGE_luci-i18n-dockerman-zh-cn=y
+        CONFIG_PACKAGE_luci-lib-docker=y
+        
+        # 取消选择其他设备以加快编译速度
+        # CONFIG_TARGET_rockchip_armv8_DEVICE_friendlyarm_nanopi-r2s is not set
+        # CONFIG_TARGET_rockchip_armv8_DEVICE_friendlyarm_nanopi-r4s is not set
+        # CONFIG_TARGET_rockchip_armv8_DEVICE_friendlyarm_nanopi-r5c is not set
+        # CONFIG_TARGET_rockchip_armv8_DEVICE_friendlyarm_nanopi-r5s is not set
+        # CONFIG_TARGET_rockchip_armv8_DEVICE_xunlong_orangepi-r1-plus is not set
+        # CONFIG_TARGET_rockchip_armv8_DEVICE_xunlong_orangepi-r1-plus-lts is not set
+        ' >> .config
+        
+        # 更新配置
+        make defconfig
+
+    - name: Download the installation package
+      id: package
+      run: |
+        cd openwrt
+        make download -j$(nproc)
+        find dl -size -1024c -exec ls -l {} \;
+        find dl -size -1024c -exec rm -f {} \;
+
+    # 修复Rust编译问题
+    - name: Fix Rust compilation (disable LLVM download)
+      run: |
+        cd openwrt
+        # 查找Rust的Makefile
+        RUST_MAKEFILE="feeds/packages/lang/rust/Makefile"
+        if [ -f "$RUST_MAKEFILE" ]; then
+          echo "Found Rust Makefile, modifying to disable LLVM download..."
+          # 备份原文件
+          cp "$RUST_MAKEFILE" "$RUST_MAKEFILE.bak"
+          # 修改download-ci-llvm设置为false
+          sed -i 's/--set=llvm.download-ci-llvm=true/--set=llvm.download-ci-llvm=false/g' "$RUST_MAKEFILE"
+          # 如果没找到，直接添加配置
+          if ! grep -q "download-ci-llvm" "$RUST_MAKEFILE"; then
+            sed -i '/define Host\/Configure/i HOST_CONFIGURE_ARGS += --set=llvm.download-ci-llvm=false' "$RUST_MAKEFILE"
+          fi
+          echo "Rust Makefile modified successfully"
+        else
+          echo "Rust Makefile not found, skipping..."
+        fi
+        
+        # 或者直接在编译时设置环境变量（备用方案）
+        echo "RUST_BOOTSTRAP_CONFIG='[llvm]\ndownload-ci-llvm = false'" >> $GITHUB_ENV
+
+    - name: Clean Rust build cache
+      run: |
+        cd openwrt
+        if [ -d "feeds/packages/lang/rust" ]; then
+          echo "Cleaning Rust build cache..."
+          make package/feeds/packages/rust/clean || true
+          rm -rf build_dir/target-*/rust-* || true
+          rm -rf build_dir/host/rustc-* || true
+          rm -rf dl/rust-* || true
+        fi
+        echo "Clean completed"
+
+    - name: Compile the firmware (R4SE only)
+      id: compile
+      run: |
+        cd openwrt
+        echo "Compiling for R4SE only with $(nproc) threads"
+        # 设置只编译R4SE
+        export BUILD_DEVICE=friendlyarm_nanopi-r4se
+        # 尝试多线程编译，如果失败则单线程编译并输出详细日志
+        make -j$(nproc) || make -j1 V=s
+        echo "date1=$(date +'%Y.%m.%d')" >> $GITHUB_ENV
+        echo "date2=$(date "+%Y年%m月%d日")" >> $GITHUB_ENV
+        echo "status=success" >> $GITHUB_OUTPUT
+
+    - name: Organize and Rename Files
+      id: organize
+      if: ${{ env.UPLOAD_FIRMWARE == 'true' && !cancelled() }}
+      run: |
+        cd openwrt/bin/targets/rockchip/armv8
+        rm -rf packages *.buildinfo *.manifest *.json
+        # 只保留R4SE相关的固件文件
+        for file in *r4se*.img.gz; do
+            if [ -f "$file" ]; then
+                mv "$file" "docker-$file"
+                echo "Found R4SE firmware: $file"
+            fi
+        done
+        # 删除其他可能的固件文件
+        rm -f *r2s*.img.gz *r4s*.img.gz *r5c*.img.gz *r5s*.img.gz *orangepi*.img.gz || true
+        echo "FIRMWARE=$PWD" >> $GITHUB_ENV
+        echo "status=success" >> $GITHUB_OUTPUT
+        
+    - name: Upload the firmware to github
+      uses: actions/upload-artifact@main
+      if: steps.organize.outputs.status == 'success' && !cancelled()
+      with:
+        name: ${{ env.date1 }}_${{ env.OPENWRT_NAME }}_${{ env.DEVICE_NAME }}
+        path: ${{ env.FIRMWARE }}
+
+    - name: Generate release tags
+      id: tag
+      if: env.UPLOAD_RELEASE == 'true' && !cancelled()
+      run: |
+        echo "release_tag=R4SE_${{ env.date2 }}" >> $GITHUB_OUTPUT
+        cat > release.txt << EOF
+        📥 R4SE 固件下载
+        
+        - 设备: NanoPi R4SE
+        - 版本: ${{ env.date2 }}
+        - 包含: Docker, dockerman等组件
+        
+        固件文件已命名为 docker-*.img.gz 格式
+        EOF
+        echo "status=success" >> $GITHUB_OUTPUT
+        
+    - name: Publish to release
+      uses: softprops/action-gh-release@v1
+      if: steps.tag.outputs.status == 'success' && !cancelled()
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        files: ${{ env.FIRMWARE }}/*
+        name: immortalwrt_R4SE_${{ env.date2 }}
+        tag_name: ${{ steps.tag.outputs.release_tag }}
+        body_path: release.txt
