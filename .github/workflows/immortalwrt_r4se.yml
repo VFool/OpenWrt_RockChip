@@ -1,4 +1,4 @@
-name: immortalwrt_r4se
+name: immortalwrt_r4se_docker
 
 on:
   schedule:
@@ -15,7 +15,7 @@ env:
   UPLOAD_RELEASE: true
   TZ: Asia/Shanghai
   OPENWRT_NAME: immortalwrt
-  DEVICE_NAME: r4se  # 修改为R4SE
+  DEVICE_NAME: r4se
 
 jobs:
   build:
@@ -61,10 +61,12 @@ jobs:
             ninja-build p7zip p7zip-full patch pkgconf python3 python3-pip python3-ply python3-docutils \
             python3-pyelftools qemu-utils re2c rsync scons squashfs-tools subversion swig texinfo uglifyjs \
             upx-ucl unzip vim wget xmlto xxd zlib1g-dev zstd
-        sudo -E apt-get -qq purge azure-cli ghc* zulu* hhvm llvm* firefox powershell openjdk* dotnet* google* mysql* php* android* rename speedtest-cli
-        sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc
-        sudo -E apt-get -qq autoremove --purge
-        sudo -E apt-get -qq clean
+        
+        # 清理不需要的大包（避免hhvm不存在的问题）
+        sudo -E apt-get -qq purge azure-cli ghc* zulu* firefox powershell openjdk* dotnet* google* mysql* php* android* rename speedtest-cli || true
+        sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc || true
+        sudo -E apt-get -qq autoremove --purge || true
+        sudo -E apt-get -qq clean || true
         sudo timedatectl set-timezone "$TZ"
         
     - name: Initialize Environment and Display System Info
@@ -72,7 +74,7 @@ jobs:
         DEBIAN_FRONTEND: noninteractive
       run: |
         chmod +x $OPENWRT_NAME/*.sh
-        $GITHUB_WORKSPACE/$OPENWRT_NAME/system-Information.sh
+        $GITHUB_WORKSPACE/$OPENWRT_NAME/system-Information.sh || true
         
     - name: Download firmware source code
       run: |
@@ -96,12 +98,13 @@ jobs:
         chmod +x $OPENWRT_NAME/*.sh && cd openwrt
         $GITHUB_WORKSPACE/$DIY_P2_SH
 
-    - name: Configure for R4SE only
+    - name: Configure for R4SE and Docker
+      id: package
       run: |
         cd openwrt
-        # 只保留R4SE相关配置，移除其他设备
+        # 添加Docker配置和R4SE设备配置
         echo '
-        # 目标系统配置
+        # 目标系统配置 - 只保留R4SE
         CONFIG_TARGET_rockchip=y
         CONFIG_TARGET_rockchip_armv8=y
         CONFIG_TARGET_rockchip_armv8_DEVICE_friendlyarm_nanopi-r4se=y
@@ -126,13 +129,7 @@ jobs:
         # CONFIG_TARGET_rockchip_armv8_DEVICE_xunlong_orangepi-r1-plus-lts is not set
         ' >> .config
         
-        # 更新配置
         make defconfig
-
-    - name: Download the installation package
-      id: package
-      run: |
-        cd openwrt
         make download -j$(nproc)
         find dl -size -1024c -exec ls -l {} \;
         find dl -size -1024c -exec rm -f {} \;
@@ -158,7 +155,7 @@ jobs:
           echo "Rust Makefile not found, skipping..."
         fi
         
-        # 或者直接在编译时设置环境变量（备用方案）
+        # 设置环境变量作为备用方案
         echo "RUST_BOOTSTRAP_CONFIG='[llvm]\ndownload-ci-llvm = false'" >> $GITHUB_ENV
 
     - name: Clean Rust build cache
@@ -177,7 +174,7 @@ jobs:
       id: compile
       run: |
         cd openwrt
-        echo "Compiling for R4SE only with $(nproc) threads"
+        echo "Compiling R4SE firmware with $(nproc) threads"
         # 设置只编译R4SE
         export BUILD_DEVICE=friendlyarm_nanopi-r4se
         # 尝试多线程编译，如果失败则单线程编译并输出详细日志
@@ -192,14 +189,14 @@ jobs:
       run: |
         cd openwrt/bin/targets/rockchip/armv8
         rm -rf packages *.buildinfo *.manifest *.json
-        # 只保留R4SE相关的固件文件
+        # 只重命名R4SE相关的固件文件
         for file in *r4se*.img.gz; do
             if [ -f "$file" ]; then
                 mv "$file" "docker-$file"
-                echo "Found R4SE firmware: $file"
+                echo "Found and renamed: $file"
             fi
         done
-        # 删除其他可能的固件文件
+        # 删除其他设备的固件（如果有）
         rm -f *r2s*.img.gz *r4s*.img.gz *r5c*.img.gz *r5s*.img.gz *orangepi*.img.gz || true
         echo "FIRMWARE=$PWD" >> $GITHUB_ENV
         echo "status=success" >> $GITHUB_OUTPUT
@@ -208,7 +205,7 @@ jobs:
       uses: actions/upload-artifact@main
       if: steps.organize.outputs.status == 'success' && !cancelled()
       with:
-        name: ${{ env.date1 }}_${{ env.OPENWRT_NAME }}_${{ env.DEVICE_NAME }}
+        name: ${{ env.date1 }}_${{ env.OPENWRT_NAME }}_${{ env.DEVICE_NAME }}_docker
         path: ${{ env.FIRMWARE }}
 
     - name: Generate release tags
@@ -217,13 +214,18 @@ jobs:
       run: |
         echo "release_tag=R4SE_${{ env.date2 }}" >> $GITHUB_OUTPUT
         cat > release.txt << EOF
-        📥 R4SE 固件下载
+        📥 R4SE Docker固件下载
         
         - 设备: NanoPi R4SE
         - 版本: ${{ env.date2 }}
-        - 包含: Docker, dockerman等组件
+        - 包含组件:
+          * Docker
+          * Docker Compose
+          * Luci-app-dockerman
+          * Luci-i18n-dockerman-zh-cn
+          * Luci-lib-docker
         
-        固件文件已命名为 docker-*.img.gz 格式
+        固件文件已命名为 docker-*.img.gz 格式，可直接写入TF卡使用。
         EOF
         echo "status=success" >> $GITHUB_OUTPUT
         
@@ -234,6 +236,6 @@ jobs:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       with:
         files: ${{ env.FIRMWARE }}/*
-        name: immortalwrt_R4SE_${{ env.date2 }}
+        name: immortalwrt_R4SE_Docker_${{ env.date2 }}
         tag_name: ${{ steps.tag.outputs.release_tag }}
         body_path: release.txt
