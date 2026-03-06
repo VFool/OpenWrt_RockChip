@@ -85,7 +85,9 @@ jobs:
       run: |
         ./scripts/feeds update -a
         ./scripts/feeds install -a
-        
+    - name: Build (without tests)
+      run: |
+        make package/python3/compile V=s
     - name: Load feeds.conf.default
       run: |
         chmod +x $OPENWRT_NAME/*.sh
